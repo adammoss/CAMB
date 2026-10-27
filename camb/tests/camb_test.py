@@ -199,7 +199,7 @@ class CambTest(unittest.TestCase):
             },
         )
         params2 = camb.get_valid_numerical_params(dark_energy_model="AxionEffectiveFluid")
-        self.assertEqual(params2.difference(params), {"fde_zc", "w_n", "zc", "theta_i"})
+        self.assertEqual(params2.difference(params), {"fde_zc", "w_n", "zc", "theta_i", "beta", "oms", "first_spike"})
         pars = def_set_params(
             H0=67,
             ombh2=0.022,

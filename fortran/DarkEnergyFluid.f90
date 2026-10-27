@@ -18,6 +18,9 @@
     procedure :: PerturbationEvolve => TDarkEnergyFluid_PerturbationEvolve
     end type TDarkEnergyFluid
 
+    ! maximum number of spike fluids in TAxionEffectiveFluid; must match max_spikes in dark_energy.py
+    integer, parameter :: max_spikes = 50
+
     ! Example implementation of fluid model using specific analytic form
     ! (approximate effective axion fluid model from arXiv:1806.10608, with c_s^2=1 if n=infinity (w_n=1))
     ! This is an example, it's not supposed to be a rigorous model!  (not very well tested)
@@ -26,9 +29,18 @@
         real(dl) :: fde_zc = 0._dl ! energy density fraction at a_c (not the same as peak dark energy fraction)
         real(dl) :: zc ! transition redshift (scale factor a_c)
         real(dl) :: theta_i = const_pi/2 ! Initial value
+        ! Spike mode: replace the single axion fluid with a sum of num_spikes fluids, each with
+        ! rho_i(a) = oms(i) * (2 a_i^beta/(a^beta + a_i^beta))^(6/beta), log-spaced in a from first_spike to 1
+        logical :: use_spikes = .false.
+        real(dl) :: beta = 6._dl ! steepness of each spike
+        real(dl) :: cs2 = 1._dl ! sound speed squared of the spike fluid
+        real(dl) :: oms(max_spikes) = 0._dl ! spike amplitudes (ordered from late to early times)
+        integer :: num_spikes = 0
+        real(dl) :: first_spike = 1.e-5_dl ! scale factor of the earliest spike
         ! om is Omega of the early DE component today (assumed to be negligible compared to omega_lambda)
         ! omL is the lambda component of the total dark energy omega
         real(dl), private :: a_c, pow, om, omL, acpow, freq, n ! cached internally
+        real(dl), private :: acpows(max_spikes), oms0(max_spikes) ! cached a_i^beta and Omega_i today
     contains
     procedure :: ReadParams => TAxionEffectiveFluid_ReadParams
     procedure, nopass :: PythonClass => TAxionEffectiveFluid_PythonClass
@@ -148,6 +160,7 @@
     use IniObjects
     class(TAxionEffectiveFluid) :: this
     class(TIniFile), intent(in) :: Ini
+    integer :: i
 
     call this%TDarkEnergyModel%ReadParams(Ini)
     if (Ini%HasKey('AxionEffectiveFluid_a_c')) then
@@ -157,6 +170,18 @@
     this%fde_zc = Ini%Read_Double('AxionEffectiveFluid_fde_zc')
     this%zc = Ini%Read_Double('AxionEffectiveFluid_zc')
     call Ini%Read('AxionEffectiveFluid_theta_i', this%theta_i)
+    call Ini%Read('AxionEffectiveFluid_use_spikes', this%use_spikes)
+    if (this%use_spikes) then
+        call Ini%Read('AxionEffectiveFluid_beta', this%beta)
+        call Ini%Read('AxionEffectiveFluid_cs2', this%cs2)
+        call Ini%Read('AxionEffectiveFluid_first_spike', this%first_spike)
+        this%num_spikes = Ini%Read_Int('AxionEffectiveFluid_num_spikes')
+        if (this%num_spikes < 1 .or. this%num_spikes > max_spikes) &
+            error stop 'AxionEffectiveFluid_num_spikes must be between 1 and max_spikes'
+        do i = 1, this%num_spikes
+            this%oms(i) = Ini%Read_Double_Array('AxionEffectiveFluid_oms', i)
+        end do
+    end if
 
     end subroutine TAxionEffectiveFluid_ReadParams
 
@@ -182,11 +207,12 @@
     use classes
     class(TAxionEffectiveFluid), intent(inout) :: this
     class(TCAMBdata), intent(in), target :: State
-    real(dl) :: grho_rad, F, p, mu, xc, n
+    real(dl) :: grho_rad, F, p, mu, xc, n, ac
+    integer :: i
 
     select type (State)
     class is (CAMBdata)
-        this%is_cosmological_constant = this%fde_zc == 0
+        this%is_cosmological_constant = this%fde_zc == 0 .and. .not. this%use_spikes
         this%pow = 3*(1 + this%w_n)
         this%a_c = 1/(1 + this%zc)
         this%acpow = this%a_c**this%pow
@@ -195,6 +221,23 @@
             (State%grho_no_de(this%a_c)/this%a_c**4/State%grhocrit + State%Omega_de)/(1 + 1/this%acpow)
         this%omL = State%Omega_de - this%om ! Omega_de is total dark energy density today
         this%num_perturb_equations = 2
+        if (this%use_spikes) then
+            if (this%num_spikes < 1 .or. this%num_spikes > max_spikes) &
+                error stop 'TAxionEffectiveFluid: num_spikes must be between 1 and max_spikes'
+            ! spikes log-spaced in a from 1 (i=1) down to first_spike (i=num_spikes)
+            this%omL = State%Omega_de
+            do i = 1, this%num_spikes
+                if (this%num_spikes > 1) then
+                    ac = 10**(log10(this%first_spike)*(i - 1)/(this%num_spikes - 1._dl))
+                else
+                    ac = this%first_spike
+                end if
+                this%acpows(i) = ac**this%beta
+                ! Omega_i today
+                this%oms0(i) = this%oms(i)*((2*this%acpows(i))/(1 + this%acpows(i)))**(6._dl/this%beta)
+                this%omL = this%omL - this%oms0(i)
+            end do
+        end if
         if (this%w_n < 0.9999) then
             ! n <> infinity
             ! get (very) approximate result for sound speed parameter; arXiv:1806.10608 Eq 30
@@ -222,11 +265,26 @@
     real(dl) :: TAxionEffectiveFluid_w_de
     real(dl), intent(in) :: a
     real(dl) :: om_t, apow, apc
+    real(dl) :: rho, weff, w_i, rho_i
+    integer :: i
 
-    apow = a**this%pow
-    apc = apow + this%acpow
-    om_t = this%om*(1 + this%acpow)/apc ! early DE contribution to relative density
-    TAxionEffectiveFluid_w_de = om_t*(1 + this%w_n)*apow/(apc*(this%omL + om_t)) - 1
+    if (this%use_spikes) then
+        apow = a**this%beta
+        rho = this%omL
+        weff = -this%omL
+        do i = 1, this%num_spikes
+            rho_i = this%oms(i)*((2*this%acpows(i))/(apow + this%acpows(i)))**(6._dl/this%beta)
+            w_i = 2._dl/(1._dl + this%acpows(i)/apow) - 1
+            rho = rho + rho_i
+            weff = weff + w_i*rho_i
+        end do
+        TAxionEffectiveFluid_w_de = weff/rho
+    else
+        apow = a**this%pow
+        apc = apow + this%acpow
+        om_t = this%om*(1 + this%acpow)/apc ! early DE contribution to relative density
+        TAxionEffectiveFluid_w_de = om_t*(1 + this%w_n)*apow/(apc*(this%omL + om_t)) - 1
+    end if
 
     end function TAxionEffectiveFluid_w_de
 
@@ -234,9 +292,20 @@
     class(TAxionEffectiveFluid) :: this
     real(dl) :: TAxionEffectiveFluid_grho_de, apc
     real(dl), intent(in) :: a
+    real(dl) :: rho, om, apow
+    integer :: i
 
     if (a == 0.d0) then
         TAxionEffectiveFluid_grho_de = 0.d0
+    else if (this%use_spikes) then
+        apow = a**this%beta
+        rho = this%omL
+        om = this%omL
+        do i = 1, this%num_spikes
+            rho = rho + this%oms(i)*((2*this%acpows(i))/(apow + this%acpows(i)))**(6._dl/this%beta)
+            om = om + this%oms0(i)
+        end do
+        TAxionEffectiveFluid_grho_de = rho*a**4/om
     else
         apc = a**this%pow + this%acpow
         TAxionEffectiveFluid_grho_de = (this%omL*apc + this%om*(1 + this%acpow))*a**4 &
@@ -252,22 +321,53 @@
     real(dl), intent(in) :: a, adotoa, w, k, z, y(:)
     integer, intent(in) :: w_ix
     real(dl) Hv3_over_k, deriv, apow, acpow, apc, cs2, fac, k2
+    real(dl) :: rho, weff, dweff, w_i, rho_i, acp
+    integer :: i
 
-    k2 = k**2
-    apow = a**this%pow
-    acpow = this%acpow
-    if (this%w_n < 0.9999) then
-        ! a**(2-6*this%w_n) = a**8/apow**2 since pow = 3*(1+w_n)
-        fac = 2*this%freq**2*a**8/apow**2
-        cs2 = (fac*(this%n - 1) + k2)/(fac*(this%n + 1) + k2)
+    if (this%use_spikes) then
+        cs2 = this%cs2
+        apow = a**this%beta
+        ! Work with 1+w_i rather than w_i to avoid cancellation when all spikes have w -> -1 at early times.
+        ! For each spike rho_i = oms(i)*(2 a_i^beta/(a^beta + a_i^beta))^(6/beta), 1+w_i = 2 a^beta/(a^beta + a_i^beta),
+        ! so drho_i/dlna = -3(1+w_i) rho_i and dw_i/dlna = beta (1+w_i)(1 - (1+w_i)/2).
+        ! With P = sum (1+w_i) rho_i, 1+w = P/rho and (dw/dlna)/(1+w) = dP/dlna/P - drho/dlna/rho.
+        rho = this%omL
+        dweff = 0 ! dP/dlna
+        weff = 0 ! P
+        do i = 1, this%num_spikes
+            acp = this%acpows(i)
+            rho_i = this%oms(i)*((2*acp)/(apow + acp))**(6._dl/this%beta)
+            w_i = 2*apow/(apow + acp) ! 1 + w_i
+            rho = rho + rho_i
+            weff = weff + w_i*rho_i
+            dweff = dweff + w_i*rho_i*(this%beta*(1 - w_i/2) - 3*w_i)
+        end do
+        if (weff /= 0) then
+            ! dw/dlog a/(1+w)
+            deriv = dweff/weff + 3*weff/rho
+        else
+            deriv = 0
+        end if
+        ! derivative should not exceed the spike steepness
+        deriv = min(deriv, this%beta)
+        if (deriv /= deriv) error stop 'TAxionEffectiveFluid: non-finite dw/dlna in spike mode'
     else
-        cs2 = 1
+        k2 = k**2
+        apow = a**this%pow
+        acpow = this%acpow
+        if (this%w_n < 0.9999) then
+            ! a**(2-6*this%w_n) = a**8/apow**2 since pow = 3*(1+w_n)
+            fac = 2*this%freq**2*a**8/apow**2
+            cs2 = (fac*(this%n - 1) + k2)/(fac*(this%n + 1) + k2)
+        else
+            cs2 = 1
+        end if
+        apc = apow + acpow
+        ! dw/dlog a/(1+w)
+        deriv = (acpow**2*(this%om + this%omL) + this%om*acpow - apow**2*this%omL)*this%pow &
+            /(apc*(this%omL*apc + this%om*(1 + acpow)))
     end if
-    apc = apow + acpow
     Hv3_over_k = 3*adotoa*y(w_ix + 1)/k
-    ! dw/dlog a/(1+w)
-    deriv = (acpow**2*(this%om + this%omL) + this%om*acpow - apow**2*this%omL)*this%pow &
-        /(apc*(this%omL*apc + this%om*(1 + acpow)))
     ! density perturbation
     ayprime(w_ix) = -3*adotoa*(cs2 - w)*(y(w_ix) + Hv3_over_k) &
         - k*y(w_ix + 1) - (1 + w)*k*z - adotoa*deriv*Hv3_over_k

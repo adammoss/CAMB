@@ -149,6 +149,10 @@ class DarkEnergyPPF(DarkEnergyEqnOfState):
     _ini_name = "ppf"
 
 
+# maximum number of spike fluids in AxionEffectiveFluid; must match max_spikes in DarkEnergyFluid.f90
+max_spikes = 50
+
+
 @fortran_class
 class AxionEffectiveFluid(DarkEnergyModel):
     """
@@ -162,15 +166,61 @@ class AxionEffectiveFluid(DarkEnergyModel):
         ("fde_zc", c_double, "energy density fraction at z=zc"),
         ("zc", c_double, "decay transition redshift (not same as peak of energy density fraction)"),
         ("theta_i", c_double, "initial condition field value"),
+        ("use_spikes", c_bool, "replace the single axion fluid with a sum of spike fluids"),
+        ("beta", c_double, "steepness of each spike in the energy density"),
+        ("cs2", c_double, "sound speed squared of the spike fluid"),
+        ("oms", c_double * max_spikes, "spike amplitudes (fraction of critical density at spike peak)"),
+        ("num_spikes", c_int, "number of spikes used"),
+        ("first_spike", c_double, "scale factor of the earliest spike; spikes are log-spaced in a up to a=1"),
     )
 
     _fortran_class_name_ = "TAxionEffectiveFluid"
     _fortran_class_module_ = "DarkEnergyFluid"
 
-    def set_params(self, w_n, fde_zc, zc, theta_i=None):
+    def set_params(
+        self,
+        w_n=1.0,
+        fde_zc=0.05,
+        zc=1000.0,
+        theta_i=None,
+        beta=6.0,
+        oms=None,
+        cs2=1.0,
+        first_spike=1.0e-5,
+        increasing_a=True,
+    ):
+        r"""
+        Set the model parameters. If ``oms`` is given, the single axion-like fluid is replaced by a sum of
+        ``len(oms)`` spike fluids, log-spaced in scale factor between ``first_spike`` and 1, each with energy
+        density :math:`\Omega_i (2 a_i^\beta / (a^\beta + a_i^\beta))^{6/\beta}`.
+
+        :param w_n: effective equation of state parameter (ignored when using spikes)
+        :param fde_zc: energy density fraction at z=zc (ignored when using spikes)
+        :param zc: decay transition redshift (ignored when using spikes)
+        :param theta_i: initial condition field value
+        :param beta: steepness of each spike
+        :param oms: list of spike amplitudes (at most ``max_spikes``), or None for the standard axion fluid
+        :param cs2: sound speed squared of the spike fluid
+        :param first_spike: scale factor of the earliest spike
+        :param increasing_a: if True, ``oms`` is ordered from early to late times
+        """
         self.w_n = w_n
         self.fde_zc = fde_zc
         self.zc = zc
+        self.beta = beta
+        self.cs2 = cs2
+        if oms is not None:
+            if len(oms) > max_spikes:
+                raise CAMBError(f"at most {max_spikes} spikes are supported")
+            self.use_spikes = True
+            self.first_spike = first_spike
+            self.num_spikes = len(oms)
+            if increasing_a:
+                oms = list(reversed(oms))
+            self.oms[:] = list(oms) + [0.0] * (max_spikes - len(oms))
+        else:
+            self.use_spikes = False
+            self.num_spikes = 0
         if theta_i is not None:
             self.theta_i = theta_i
 
@@ -186,6 +236,14 @@ class AxionEffectiveFluid(DarkEnergyModel):
                 "theta_i": "AxionEffectiveFluid_theta_i",
             },
         )
+        state.set("AxionEffectiveFluid_use_spikes", self.use_spikes)
+        if self.use_spikes:
+            state.set("AxionEffectiveFluid_beta", self.beta)
+            state.set("AxionEffectiveFluid_cs2", self.cs2)
+            state.set("AxionEffectiveFluid_first_spike", self.first_spike)
+            state.set("AxionEffectiveFluid_num_spikes", self.num_spikes)
+            for i in range(self.num_spikes):
+                state.set(f"AxionEffectiveFluid_oms({i + 1})", self.oms[i])
 
 
 # base class for scalar field quintessence models
