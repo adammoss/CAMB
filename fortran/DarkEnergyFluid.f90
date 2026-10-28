@@ -41,6 +41,8 @@
         ! omL is the lambda component of the total dark energy omega
         real(dl), private :: a_c, pow, om, omL, acpow, freq, n ! cached internally
         real(dl), private :: acpows(max_spikes), oms0(max_spikes) ! cached a_i^beta and Omega_i today
+        integer, private :: num_active = 0, active(max_spikes) ! indices of spikes with non-zero amplitude
+        real(dl), private :: six_over_beta = 1._dl
     contains
     procedure :: ReadParams => TAxionEffectiveFluid_ReadParams
     procedure, nopass :: PythonClass => TAxionEffectiveFluid_PythonClass
@@ -226,6 +228,8 @@
                 error stop 'TAxionEffectiveFluid: num_spikes must be between 1 and max_spikes'
             ! spikes log-spaced in a from 1 (i=1) down to first_spike (i=num_spikes)
             this%omL = State%Omega_de
+            this%six_over_beta = 6._dl/this%beta
+            this%num_active = 0
             do i = 1, this%num_spikes
                 if (this%num_spikes > 1) then
                     ac = 10**(log10(this%first_spike)*(i - 1)/(this%num_spikes - 1._dl))
@@ -234,8 +238,14 @@
                 end if
                 this%acpows(i) = ac**this%beta
                 ! Omega_i today
-                this%oms0(i) = this%oms(i)*((2*this%acpows(i))/(1 + this%acpows(i)))**(6._dl/this%beta)
+                this%oms0(i) = this%oms(i)*((2*this%acpows(i))/(1 + this%acpows(i)))**this%six_over_beta
                 this%omL = this%omL - this%oms0(i)
+                ! only non-zero components are evaluated in the (frequently called) background and
+                ! perturbation routines
+                if (this%oms(i) /= 0._dl) then
+                    this%num_active = this%num_active + 1
+                    this%active(this%num_active) = i
+                end if
             end do
         end if
         if (this%w_n < 0.9999) then
@@ -266,18 +276,21 @@
     real(dl), intent(in) :: a
     real(dl) :: om_t, apow, apc
     real(dl) :: rho, weff, w_i, rho_i
-    integer :: i
+    integer :: i, j
 
     if (this%use_spikes) then
-        apow = a**this%beta
         rho = this%omL
         weff = -this%omL
-        do i = 1, this%num_spikes
-            rho_i = this%oms(i)*((2*this%acpows(i))/(apow + this%acpows(i)))**(6._dl/this%beta)
-            w_i = 2._dl/(1._dl + this%acpows(i)/apow) - 1
-            rho = rho + rho_i
-            weff = weff + w_i*rho_i
-        end do
+        if (this%num_active > 0) then
+            apow = a**this%beta
+            do j = 1, this%num_active
+                i = this%active(j)
+                rho_i = this%oms(i)*((2*this%acpows(i))/(apow + this%acpows(i)))**this%six_over_beta
+                w_i = 2._dl/(1._dl + this%acpows(i)/apow) - 1
+                rho = rho + rho_i
+                weff = weff + w_i*rho_i
+            end do
+        end if
         TAxionEffectiveFluid_w_de = weff/rho
     else
         apow = a**this%pow
@@ -293,18 +306,21 @@
     real(dl) :: TAxionEffectiveFluid_grho_de, apc
     real(dl), intent(in) :: a
     real(dl) :: rho, om, apow
-    integer :: i
+    integer :: i, j
 
     if (a == 0.d0) then
         TAxionEffectiveFluid_grho_de = 0.d0
     else if (this%use_spikes) then
-        apow = a**this%beta
         rho = this%omL
         om = this%omL
-        do i = 1, this%num_spikes
-            rho = rho + this%oms(i)*((2*this%acpows(i))/(apow + this%acpows(i)))**(6._dl/this%beta)
-            om = om + this%oms0(i)
-        end do
+        if (this%num_active > 0) then
+            apow = a**this%beta
+            do j = 1, this%num_active
+                i = this%active(j)
+                rho = rho + this%oms(i)*((2*this%acpows(i))/(apow + this%acpows(i)))**this%six_over_beta
+                om = om + this%oms0(i)
+            end do
+        end if
         TAxionEffectiveFluid_grho_de = rho*a**4/om
     else
         apc = a**this%pow + this%acpow
@@ -322,7 +338,7 @@
     integer, intent(in) :: w_ix
     real(dl) Hv3_over_k, deriv, apow, acpow, apc, cs2, fac, k2
     real(dl) :: rho, weff, dweff, w_i, rho_i, acp
-    integer :: i
+    integer :: i, j
 
     if (this%use_spikes) then
         cs2 = this%cs2
@@ -334,9 +350,10 @@
         rho = this%omL
         dweff = 0 ! dP/dlna
         weff = 0 ! P
-        do i = 1, this%num_spikes
+        do j = 1, this%num_active
+            i = this%active(j)
             acp = this%acpows(i)
-            rho_i = this%oms(i)*((2*acp)/(apow + acp))**(6._dl/this%beta)
+            rho_i = this%oms(i)*((2*acp)/(apow + acp))**this%six_over_beta
             w_i = 2*apow/(apow + acp) ! 1 + w_i
             rho = rho + rho_i
             weff = weff + w_i*rho_i
@@ -394,10 +411,22 @@
     function TAxionEffectiveFluid_assume_scale_indep_lowz_growth(this)
     ! cs2 in TAxionEffectiveFluid_PerturbationEvolve is genuinely scale-dependent while the
     ! component oscillates, but that is confined to high redshift.
+    ! In spike mode this holds when every non-zero spike peaks at z > 50 (a_i < 1/51).
     class(TAxionEffectiveFluid) :: this
     logical :: TAxionEffectiveFluid_assume_scale_indep_lowz_growth
+    integer :: i
 
-    TAxionEffectiveFluid_assume_scale_indep_lowz_growth = this%zc > 50._dl
+    if (this%use_spikes) then
+        TAxionEffectiveFluid_assume_scale_indep_lowz_growth = .true.
+        do i = 1, this%num_spikes
+            if (this%oms(i) /= 0._dl .and. this%acpows(i)**(1._dl/this%beta) > 1._dl/51._dl) then
+                TAxionEffectiveFluid_assume_scale_indep_lowz_growth = .false.
+                exit
+            end if
+        end do
+    else
+        TAxionEffectiveFluid_assume_scale_indep_lowz_growth = this%zc > 50._dl
+    end if
 
     end function TAxionEffectiveFluid_assume_scale_indep_lowz_growth
 
